@@ -12,3 +12,4 @@ wheels/
 .env
 /results
 /resources
+/models
