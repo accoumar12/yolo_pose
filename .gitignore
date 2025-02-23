@@ -10,6 +10,6 @@ wheels/
 .venv
 
 .env
-/results
-/resources
 /models
+/exp
+/resources
