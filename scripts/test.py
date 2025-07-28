@@ -1,6 +1,7 @@
 import time
 import json
 from pathlib import Path
+from config import RAW_DATA_DIR_PATH
 from ultralytics import YOLO
 import cv2
 
@@ -25,7 +26,7 @@ def main() -> None:
 
     # Open the video
     input_video_file_name = "test_2.mp4"
-    capture = cv2.VideoCapture(f"data/{input_video_file_name}")
+    capture = cv2.VideoCapture(RAW_DATA_DIR_PATH / input_video_file_name)
     
     # Get video properties
     frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
