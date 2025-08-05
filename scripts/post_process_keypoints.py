@@ -11,6 +11,148 @@ from pydantic import TypeAdapter
 from yolo_pose.schemas.core import FramesData, KeypointLabel
 
 
+def fit_circle_to_trajectory(x_pos: List[int], y_pos: List[int]) -> dict:
+    """
+    Fit a circle to ankle trajectory using robust least squares method.
+    Returns circle parameters and quality metrics.
+    """
+    if len(x_pos) < 3:
+        return {'circle_found': False}
+    
+    x_array = np.array(x_pos, dtype=float)
+    y_array = np.array(y_pos, dtype=float)
+    
+    # Remove outliers using IQR method to improve circle fit
+    def remove_outliers(x, y):
+        # Calculate distances from centroid
+        centroid_x, centroid_y = np.mean(x), np.mean(y)
+        distances = np.sqrt((x - centroid_x)**2 + (y - centroid_y)**2)
+        
+        # Remove points beyond 2 standard deviations
+        mean_dist = np.mean(distances)
+        std_dist = np.std(distances)
+        mask = distances <= (mean_dist + 2 * std_dist)
+        
+        return x[mask], y[mask], mask
+    
+    # Clean the data
+    x_clean, y_clean, valid_mask = remove_outliers(x_array, y_array)
+    
+    if len(x_clean) < 3:
+        return {'circle_found': False, 'error': 'Too few points after outlier removal'}
+    
+    print(f"    Using {len(x_clean)}/{len(x_array)} points after outlier removal")
+    
+    # Method: Geometric circle fitting (more robust than algebraic)
+    # Use least squares to solve: (x-h)² + (y-k)² = r²
+    
+    def geometric_circle_fit(x, y):
+        # Initial guess using centroid
+        h_init = np.mean(x)
+        k_init = np.mean(y)
+        r_init = np.mean(np.sqrt((x - h_init)**2 + (y - k_init)**2))
+        
+        # Refine using iterative approach
+        h, k, r = h_init, k_init, r_init
+        
+        for iteration in range(10):  # Maximum 10 iterations
+            # Calculate distances to current center
+            distances = np.sqrt((x - h)**2 + (y - k)**2)
+            
+            # Update radius as median distance (robust to outliers)
+            r_new = np.median(distances)
+            
+            # Update center to minimize sum of squared errors
+            # Use weighted least squares where weights favor points closer to current radius
+            weights = 1.0 / (1.0 + np.abs(distances - r_new))
+            
+            h_new = np.sum(weights * x) / np.sum(weights)
+            k_new = np.sum(weights * y) / np.sum(weights)
+            
+            # Check convergence
+            if (abs(h_new - h) < 0.1 and abs(k_new - k) < 0.1 and abs(r_new - r) < 0.1):
+                break
+                
+            h, k, r = h_new, k_new, r_new
+        
+        return h, k, r
+    
+    try:
+        center_x, center_y, radius = geometric_circle_fit(x_clean, y_clean)
+        
+        # Validate the fit - radius should be reasonable for pedaling motion
+        data_range = max(np.max(x_clean) - np.min(x_clean), np.max(y_clean) - np.min(y_clean))
+        
+        if radius > data_range * 2:  # Radius is way too large
+            return {'circle_found': False, 'error': f'Fitted radius {radius:.1f} too large (data range: {data_range:.1f})'}
+        
+        if radius < data_range * 0.1:  # Radius is too small
+            return {'circle_found': False, 'error': f'Fitted radius {radius:.1f} too small (data range: {data_range:.1f})'}
+        
+        # Calculate fit quality metrics using original data
+        distances_to_center = np.sqrt((x_array - center_x)**2 + (y_array - center_y)**2)
+        errors = np.abs(distances_to_center - radius)
+        
+        # Quality metrics
+        mean_error = np.mean(errors)
+        max_error = np.max(errors)
+        std_error = np.std(errors)
+        rmse = np.sqrt(np.mean(errors**2))
+        
+        # R-squared equivalent for circle fit
+        ss_res = np.sum(errors**2)
+        ss_tot = np.sum((distances_to_center - np.mean(distances_to_center))**2)
+        r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+        
+        # Check if fit is reasonable (errors should be small relative to radius)
+        relative_error = mean_error / radius
+        
+        # More strict quality assessment for pedaling motion
+        if relative_error > 0.3:  # Very loose fit
+            fit_quality = 'poor'
+        elif relative_error > 0.15:  # Moderate fit
+            fit_quality = 'fair'
+        elif relative_error > 0.08:  # Good fit
+            fit_quality = 'good'
+        else:  # Excellent fit
+            fit_quality = 'excellent'
+        
+        # Additional check: most points should be roughly circular
+        point_angle_consistency = np.std(distances_to_center) / radius
+        if point_angle_consistency > 0.3:
+            fit_quality = 'poor'
+        
+        return {
+            'circle_found': True,
+            'center_x': float(center_x),
+            'center_y': float(center_y),
+            'radius': float(radius),
+            'mean_error': float(mean_error),
+            'max_error': float(max_error),
+            'std_error': float(std_error),
+            'rmse': float(rmse),
+            'r_squared': float(r_squared),
+            'relative_error': float(relative_error),
+            'fit_quality': fit_quality,
+            'point_errors': errors.tolist(),
+            'distances_to_center': distances_to_center.tolist(),
+            'points_used': len(x_clean),
+            'points_removed': len(x_array) - len(x_clean),
+            'data_range': float(data_range)
+        }
+        
+    except Exception as e:
+        return {'circle_found': False, 'error': f'Circle fitting error: {str(e)}'}
+
+
+def generate_circle_points(center_x: float, center_y: float, radius: float, num_points: int = 100) -> tuple:
+    """Generate points along a circle for visualization."""
+    angles = np.linspace(0, 2*np.pi, num_points)
+    x_circle = center_x + radius * np.cos(angles)
+    y_circle = center_y + radius * np.sin(angles)
+    return x_circle, y_circle
+
+
 def extract_simple_periodic_pattern(x_pos: List[int], y_pos: List[int], frames: List[int]) -> dict:
     """
     Simple fallback pattern detection using peak/valley detection.
@@ -133,7 +275,6 @@ def extract_periodic_pattern(x_pos: List[int], y_pos: List[int], frames: List[in
     
     x_array = np.array(x_pos, dtype=float)
     y_array = np.array(y_pos, dtype=float)
-    frames_array = np.array(frames)
     
     print(f"  Analyzing trajectory with {len(x_pos)} points")
     
@@ -143,7 +284,6 @@ def extract_periodic_pattern(x_pos: List[int], y_pos: List[int], frames: List[in
     y_smooth = gaussian_filter1d(y_array, sigma=2)
     complex_smooth = x_smooth + 1j * y_smooth
     
-    # Method 1: Autocorrelation to find period
     def find_period_autocorr(input_signal, min_period=10, max_period=None):
         if max_period is None:
             max_period = len(input_signal) // 3
@@ -172,216 +312,7 @@ def extract_periodic_pattern(x_pos: List[int], y_pos: List[int], frames: List[in
     periods = [p for p in [period_y, period_x, period_complex] if p is not None]
     print(f"  Candidate periods: {periods}")
     
-    if not periods:
-        # Fallback to simple peak detection if autocorrelation fails
-        print("  Autocorrelation failed, using simple peak detection")
-        return extract_simple_periodic_pattern(x_pos, y_pos, frames)
-    
-    # Use median of different estimates
-    estimated_period = int(np.median(periods))
-    
-    print(f"  Estimated period: {estimated_period} frames")
-    
-    # Method 2: Template matching to find actual cycles (more permissive)
-    def extract_cycles_template_matching(input_signal, period):
-        cycles = []
-        
-        # Try different starting points to find the best template
-        best_template = None
-        best_score = -1
-        
-        step_size = max(1, period // 20)  # More starting points
-        for start_offset in range(0, min(period, len(input_signal) - period), step_size):
-            if start_offset + period >= len(input_signal):
-                break
-                
-            template = input_signal[start_offset:start_offset + period]
-            
-            # Cross-correlate template with entire signal
-            correlation = np.correlate(input_signal, template, mode='valid')
-            
-            # Normalize correlation
-            template_norm = np.linalg.norm(template)
-            if template_norm == 0:
-                continue
-                
-            signal_norms = np.array([np.linalg.norm(input_signal[i:i+len(template)]) 
-                                   for i in range(len(correlation))])
-            
-            with np.errstate(divide='ignore', invalid='ignore'):
-                normalized_corr = correlation / (template_norm * signal_norms)
-                normalized_corr = np.nan_to_num(normalized_corr)
-            
-            # Find score of this template
-            score = np.mean(normalized_corr)
-            
-            if score > best_score:
-                best_score = score
-                best_template = template
-        
-        if best_template is None:
-            return [], None
-        
-        print(f"    Best template score: {best_score:.3f}")
-        
-        # Now find all occurrences of the best template (more permissive)
-        correlation = np.correlate(input_signal, best_template, mode='valid')
-        template_norm = np.linalg.norm(best_template)
-        
-        cycle_starts = []
-        i = 0
-        threshold = 0.5  # Lower threshold for cycle detection
-        
-        while i < len(correlation) - len(best_template):
-            # Calculate normalized correlation at this position
-            window = input_signal[i:i+len(best_template)]
-            if len(window) == len(best_template):
-                window_norm = np.linalg.norm(window)
-                if window_norm > 0:
-                    corr_val = np.dot(best_template, window) / (template_norm * window_norm)
-                    
-                    # If correlation is high enough, this is a cycle
-                    if corr_val > threshold:
-                        cycle_starts.append(i)
-                        # Skip ahead to avoid overlapping detections
-                        i += max(1, len(best_template) // 3)  # Allow more overlap
-                    else:
-                        i += 1
-                else:
-                    i += 1
-            else:
-                break
-        
-        print(f"    Found {len(cycle_starts)} cycle starts")
-        
-        # Extract cycles based on detected starts
-        cycles = []
-        for j in range(len(cycle_starts) - 1):
-            start_idx = cycle_starts[j]
-            end_idx = cycle_starts[j + 1]
-            
-            if end_idx - start_idx > len(best_template) // 3:  # More permissive length
-                cycles.append({
-                    'start_idx': start_idx,
-                    'end_idx': end_idx,
-                    'length': end_idx - start_idx
-                })
-        
-        return cycles, best_template
-    
-    # Extract cycles using template matching
-    cycles_y, template_y = extract_cycles_template_matching(y_smooth, estimated_period)
-    cycles_x, template_x = extract_cycles_template_matching(x_smooth, estimated_period)
-    
-    # Use the method that found more cycles
-    if len(cycles_y) >= len(cycles_x):
-        cycles_info = cycles_y
-        print(f"  Using Y-based cycle detection: {len(cycles_y)} cycles")
-    else:
-        cycles_info = cycles_x
-        print(f"  Using X-based cycle detection: {len(cycles_x)} cycles")
-    
-    if len(cycles_info) < 2:
-        return {'cycles': [], 'pattern_found': False}
-    
-    # Extract cycle data
-    cycle_data = []
-    for cycle in cycles_info:
-        start_idx = cycle['start_idx']
-        end_idx = cycle['end_idx']
-        
-        cycle_x = x_array[start_idx:end_idx]
-        cycle_y = y_array[start_idx:end_idx]
-        cycle_frames = frames_array[start_idx:end_idx]
-        
-        cycle_data.append({
-            'x': cycle_x,
-            'y': cycle_y,
-            'frames': cycle_frames,
-            'length': len(cycle_x),
-            'start_frame': frames_array[start_idx],
-            'end_frame': frames_array[end_idx]
-        })
-    
-    # Calculate average cycle length for normalization
-    cycle_lengths = [c['length'] for c in cycle_data]
-    target_length = int(np.median(cycle_lengths))
-    
-    # Normalize all cycles to same length using better interpolation
-    normalized_cycles_x = []
-    normalized_cycles_y = []
-    
-    for cycle in cycle_data:
-        if len(cycle['x']) >= 5:  # Only use cycles with enough points
-            # Use spline interpolation for smoother results
-            from scipy.interpolate import interp1d
-            
-            old_indices = np.linspace(0, 1, len(cycle['x']))
-            new_indices = np.linspace(0, 1, target_length)
-            
-            # Create interpolation functions
-            try:
-                f_x = interp1d(old_indices, cycle['x'], kind='cubic', 
-                              bounds_error=False, fill_value='extrapolate')
-                f_y = interp1d(old_indices, cycle['y'], kind='cubic', 
-                              bounds_error=False, fill_value='extrapolate')
-                
-                interp_x = f_x(new_indices)
-                interp_y = f_y(new_indices)
-                
-                normalized_cycles_x.append(interp_x)
-                normalized_cycles_y.append(interp_y)
-            except Exception:
-                # Fallback to linear interpolation
-                interp_x = np.interp(new_indices, old_indices, cycle['x'])
-                interp_y = np.interp(new_indices, old_indices, cycle['y'])
-                
-                normalized_cycles_x.append(interp_x)
-                normalized_cycles_y.append(interp_y)
-    
-    if not normalized_cycles_x:
-        return {'cycles': [], 'pattern_found': False}
-    
-    # Calculate average pattern and statistics
-    avg_pattern_x = np.mean(normalized_cycles_x, axis=0)
-    avg_pattern_y = np.mean(normalized_cycles_y, axis=0)
-    std_pattern_x = np.std(normalized_cycles_x, axis=0)
-    std_pattern_y = np.std(normalized_cycles_y, axis=0)
-    
-    # Calculate pattern quality metrics
-    pattern_consistency = 1.0 / (1.0 + np.mean(std_pattern_x) + np.mean(std_pattern_y))
-    
-    # Calculate how well each cycle matches the average
-    cycle_similarities = []
-    for i, (cycle_x, cycle_y) in enumerate(zip(normalized_cycles_x, normalized_cycles_y)):
-        # Calculate correlation with average pattern
-        corr_x = np.corrcoef(cycle_x, avg_pattern_x)[0, 1]
-        corr_y = np.corrcoef(cycle_y, avg_pattern_y)[0, 1]
-        similarity = (corr_x + corr_y) / 2
-        cycle_similarities.append(similarity)
-    
-    # Cycle timing statistics
-    frame_cycles = [(c['start_frame'], c['end_frame']) for c in cycle_data]
-    cycle_durations = [c['end_frame'] - c['start_frame'] for c in cycle_data]
-    
-    return {
-        'pattern_found': True,
-        'cycles': frame_cycles,
-        'num_cycles': len(frame_cycles),
-        'avg_pattern_x': avg_pattern_x.tolist(),
-        'avg_pattern_y': avg_pattern_y.tolist(),
-        'std_pattern_x': std_pattern_x.tolist(),
-        'std_pattern_y': std_pattern_y.tolist(),
-        'pattern_consistency': pattern_consistency,
-        'cycle_similarities': cycle_similarities,
-        'avg_similarity': np.mean(cycle_similarities),
-        'cycle_lengths': cycle_durations,
-        'avg_cycle_length': np.mean(cycle_durations),
-        'cycle_length_std': np.std(cycle_durations),
-        'target_length': target_length,
-        'estimated_period': estimated_period,
-        'all_cycle_data': cycle_data
-    }
+    return extract_simple_periodic_pattern(x_pos, y_pos, frames)
 
 
 def analyze_periodic_patterns(frames_data: FramesData, output_dir: Path) -> dict:
@@ -403,26 +334,49 @@ def analyze_periodic_patterns(frames_data: FramesData, output_dir: Path) -> dict
     
     # Analyze ankle pattern
     if ankle_frames:
+        print(f"\nANKLE ANALYSIS ({len(ankle_frames)} points):")
+        
+        # Try circle fitting first for ankle (pedal motion)
+        circle_fit = fit_circle_to_trajectory(ankle_x, ankle_y)
+        
+        if circle_fit['circle_found']:
+            print("  CIRCLE FIT RESULTS:")
+            print(f"    Center: ({circle_fit['center_x']:.1f}, {circle_fit['center_y']:.1f})")
+            print(f"    Radius: {circle_fit['radius']:.1f} pixels")
+            print(f"    Data range: {circle_fit['data_range']:.1f} pixels")
+            print(f"    Points used: {circle_fit['points_used']}/{circle_fit['points_used'] + circle_fit['points_removed']}")
+            print(f"    Fit quality: {circle_fit['fit_quality']}")
+            print(f"    Mean error: {circle_fit['mean_error']:.2f} pixels")
+            print(f"    RMSE: {circle_fit['rmse']:.2f} pixels")
+            print(f"    R-squared: {circle_fit['r_squared']:.3f}")
+            print(f"    Relative error: {circle_fit['relative_error']:.1%}")
+            
+            # Store circle results
+            results['ankle_circle'] = circle_fit
+        else:
+            print(f"  Circle fitting failed: {circle_fit.get('error', 'Unknown error')}")
+        
+        # Also try pattern detection as fallback/comparison
         ankle_pattern = extract_periodic_pattern(ankle_x, ankle_y, ankle_frames)
         results['ankle'] = ankle_pattern
         
         if ankle_pattern['pattern_found']:
-            print("\nANKLE PERIODIC MOTION:")
-            print(f"  Detected cycles: {ankle_pattern['num_cycles']}")
-            print(f"  Estimated period: {ankle_pattern['estimated_period']} frames")
-            print(f"  Average cycle length: {ankle_pattern['avg_cycle_length']:.1f} frames")
-            print(f"  Cycle length std: {ankle_pattern['cycle_length_std']:.1f} frames")
-            print(f"  Pattern consistency: {ankle_pattern['pattern_consistency']:.3f}")
-            print(f"  Average similarity: {ankle_pattern['avg_similarity']:.3f}")
-            print(f"  Pattern length: {ankle_pattern['target_length']} points")
+            print("  PATTERN DETECTION RESULTS:")
+            print(f"    Detected cycles: {ankle_pattern['num_cycles']}")
+            print(f"    Estimated period: {ankle_pattern['estimated_period']} frames")
+            print(f"    Average cycle length: {ankle_pattern['avg_cycle_length']:.1f} frames")
+            print(f"    Cycle length std: {ankle_pattern['cycle_length_std']:.1f} frames")
+            print(f"    Pattern consistency: {ankle_pattern['pattern_consistency']:.3f}")
+            print(f"    Average similarity: {ankle_pattern['avg_similarity']:.3f}")
+            print(f"    Pattern length: {ankle_pattern['target_length']} points")
             
             # Calculate motion ranges for the average pattern
             x_range = np.max(ankle_pattern['avg_pattern_x']) - np.min(ankle_pattern['avg_pattern_x'])
             y_range = np.max(ankle_pattern['avg_pattern_y']) - np.min(ankle_pattern['avg_pattern_y'])
-            print(f"  Pattern X range: {x_range:.1f} pixels")
-            print(f"  Pattern Y range: {y_range:.1f} pixels")
+            print(f"    Pattern X range: {x_range:.1f} pixels")
+            print(f"    Pattern Y range: {y_range:.1f} pixels")
         else:
-            print("\nANKLE: No periodic pattern detected")
+            print("  No periodic pattern detected")
     
     # Analyze knee pattern
     if knee_frames:
@@ -451,74 +405,131 @@ def analyze_periodic_patterns(frames_data: FramesData, output_dir: Path) -> dict
     fig, axes = plt.subplots(2, 4, figsize=(20, 12))
     
     # Plot ankle analysis
-    if ankle_frames and ankle_pattern['pattern_found']:
-        # Original trajectory
-        axes[0, 0].plot(ankle_x, ankle_y, 'lightblue', alpha=0.7, label='Full trajectory')
-        axes[0, 0].plot(ankle_pattern['avg_pattern_x'], ankle_pattern['avg_pattern_y'], 
-                       'blue', linewidth=3, label='Average pattern')
-        axes[0, 0].scatter(ankle_pattern['avg_pattern_x'][0], ankle_pattern['avg_pattern_y'][0], 
-                          color='green', s=100, marker='o', label='Pattern start')
-        axes[0, 0].set_title('Ankle: Trajectory + Average Pattern')
-        axes[0, 0].set_xlabel('X Position (pixels)')
-        axes[0, 0].set_ylabel('Y Position (pixels)')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-        axes[0, 0].invert_yaxis()
+    if ankle_frames:
+        circle_fit = results.get('ankle_circle', {'circle_found': False})
+        ankle_pattern = results.get('ankle', {'pattern_found': False})
         
-        # Individual cycles overlay
-        axes[0, 1].plot(ankle_pattern['avg_pattern_x'], ankle_pattern['avg_pattern_y'], 
-                       'black', linewidth=3, label='Average pattern')
-        for i, cycle in enumerate(ankle_pattern['all_cycle_data'][:5]):  # Show first 5 cycles
-            axes[0, 1].plot(cycle['x'], cycle['y'], alpha=0.5, label=f'Cycle {i+1}')
-        axes[0, 1].set_title('Ankle: Individual Cycles vs Average')
-        axes[0, 1].set_xlabel('X Position (pixels)')
-        axes[0, 1].set_ylabel('Y Position (pixels)')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-        axes[0, 1].invert_yaxis()
-        
-        # Pattern consistency (error bars)
-        pattern_points = np.arange(len(ankle_pattern['avg_pattern_x']))
-        axes[0, 2].errorbar(pattern_points, ankle_pattern['avg_pattern_x'], 
-                           yerr=ankle_pattern['std_pattern_x'], 
-                           alpha=0.7, label='X pattern ± std')
-        axes[0, 2].errorbar(pattern_points, ankle_pattern['avg_pattern_y'], 
-                           yerr=ankle_pattern['std_pattern_y'], 
-                           alpha=0.7, label='Y pattern ± std')
-        axes[0, 2].set_title('Ankle: Pattern Variability')
-        axes[0, 2].set_xlabel('Pattern Point Index')
-        axes[0, 2].set_ylabel('Position (pixels)')
-        axes[0, 2].legend()
-        axes[0, 2].grid(True, alpha=0.3)
-        
-        # Cycle similarity scores
-        cycle_nums = range(1, len(ankle_pattern['cycle_similarities']) + 1)
-        axes[0, 3].bar(cycle_nums, ankle_pattern['cycle_similarities'], alpha=0.7)
-        axes[0, 3].axhline(y=ankle_pattern['avg_similarity'], color='red', linestyle='--', 
-                          label=f'Average: {ankle_pattern["avg_similarity"]:.3f}')
-        axes[0, 3].set_title('Ankle: Cycle Similarity Scores')
-        axes[0, 3].set_xlabel('Cycle Number')
-        axes[0, 3].set_ylabel('Similarity to Average')
-        axes[0, 3].legend()
-        axes[0, 3].grid(True, alpha=0.3)
-    elif ankle_frames:
-        # Fallback: show raw trajectory if pattern detection failed
-        axes[0, 0].plot(ankle_x, ankle_y, 'lightblue', alpha=0.7, label='Raw trajectory')
-        axes[0, 0].scatter(ankle_x[0], ankle_y[0], color='green', s=100, marker='o', label='Start')
-        axes[0, 0].scatter(ankle_x[-1], ankle_y[-1], color='red', s=100, marker='s', label='End')
-        axes[0, 0].set_title('Ankle: Raw Trajectory (No Pattern Detected)')
-        axes[0, 0].set_xlabel('X Position (pixels)')
-        axes[0, 0].set_ylabel('Y Position (pixels)')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-        axes[0, 0].invert_yaxis()
-        
-        # Show message in other plots
-        for j in range(1, 4):
-            axes[0, j].text(0.5, 0.5, 'No periodic pattern\ndetected for ankle', 
-                           ha='center', va='center', transform=axes[0, j].transAxes,
-                           fontsize=12, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-            axes[0, j].set_title(f'Ankle: Pattern Analysis {j+1}')
+        if circle_fit['circle_found']:
+            # Show circle fit results
+            axes[0, 0].plot(ankle_x, ankle_y, 'lightblue', alpha=0.7, label='Trajectory')
+            
+            # Generate and plot fitted circle
+            circle_x, circle_y = generate_circle_points(
+                circle_fit['center_x'], circle_fit['center_y'], circle_fit['radius']
+            )
+            axes[0, 0].plot(circle_x, circle_y, 'red', linewidth=2, label='Fitted circle')
+            axes[0, 0].scatter(circle_fit['center_x'], circle_fit['center_y'], 
+                              color='red', s=100, marker='x', label='Circle center')
+            
+            # Mark start and end of trajectory
+            axes[0, 0].scatter(ankle_x[0], ankle_y[0], color='green', s=100, marker='o', label='Start')
+            axes[0, 0].scatter(ankle_x[-1], ankle_y[-1], color='orange', s=100, marker='s', label='End')
+            
+            axes[0, 0].set_title(f'Ankle: Circle Fit (R={circle_fit["radius"]:.1f}px, Quality={circle_fit["fit_quality"]})')
+            axes[0, 0].set_xlabel('X Position (pixels)')
+            axes[0, 0].set_ylabel('Y Position (pixels)')
+            axes[0, 0].legend()
+            axes[0, 0].grid(True, alpha=0.3)
+            axes[0, 0].invert_yaxis()
+            axes[0, 0].set_aspect('equal', adjustable='box')
+            
+            # Plot residuals (errors from circle)
+            point_indices = np.arange(len(circle_fit['point_errors']))
+            axes[0, 1].plot(point_indices, circle_fit['point_errors'], 'b-', alpha=0.7)
+            axes[0, 1].axhline(y=circle_fit['mean_error'], color='red', linestyle='--', 
+                              label=f'Mean error: {circle_fit["mean_error"]:.2f}px')
+            axes[0, 1].fill_between(point_indices, 
+                                   circle_fit['mean_error'] - circle_fit['std_error'],
+                                   circle_fit['mean_error'] + circle_fit['std_error'],
+                                   alpha=0.2, color='red', label='±1 std')
+            axes[0, 1].set_title('Ankle: Circle Fit Errors')
+            axes[0, 1].set_xlabel('Point Index')
+            axes[0, 1].set_ylabel('Distance Error (pixels)')
+            axes[0, 1].legend()
+            axes[0, 1].grid(True, alpha=0.3)
+            
+            # Plot distance to center over time
+            axes[0, 2].plot(point_indices, circle_fit['distances_to_center'], 'g-', alpha=0.7)
+            axes[0, 2].axhline(y=circle_fit['radius'], color='red', linestyle='--', 
+                              label=f'Ideal radius: {circle_fit["radius"]:.1f}px')
+            axes[0, 2].set_title('Ankle: Distance to Circle Center')
+            axes[0, 2].set_xlabel('Point Index')
+            axes[0, 2].set_ylabel('Distance (pixels)')
+            axes[0, 2].legend()
+            axes[0, 2].grid(True, alpha=0.3)
+            
+            # Summary statistics
+            stats_text = 'Circle Fit Statistics:\n'
+            stats_text += f'Radius: {circle_fit["radius"]:.1f} px\n'
+            stats_text += f'Center: ({circle_fit["center_x"]:.1f}, {circle_fit["center_y"]:.1f})\n'
+            stats_text += f'RMSE: {circle_fit["rmse"]:.2f} px\n'
+            stats_text += f'R²: {circle_fit["r_squared"]:.3f}\n'
+            stats_text += f'Quality: {circle_fit["fit_quality"]}'
+            
+            axes[0, 3].text(0.1, 0.9, stats_text, transform=axes[0, 3].transAxes,
+                           fontsize=10, verticalalignment='top',
+                           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            axes[0, 3].set_title('Ankle: Circle Fit Summary')
+            axes[0, 3].axis('off')
+            
+        elif ankle_pattern['pattern_found']:
+            # Fallback to pattern visualization if circle fit failed but pattern was found
+            axes[0, 0].plot(ankle_x, ankle_y, 'lightblue', alpha=0.7, label='Full trajectory')
+            axes[0, 0].plot(ankle_pattern['avg_pattern_x'], ankle_pattern['avg_pattern_y'], 
+                           'blue', linewidth=3, label='Average pattern')
+            axes[0, 0].scatter(ankle_pattern['avg_pattern_x'][0], ankle_pattern['avg_pattern_y'][0], 
+                              color='green', s=100, marker='o', label='Pattern start')
+            axes[0, 0].set_title('Ankle: Trajectory + Average Pattern')
+            axes[0, 0].set_xlabel('X Position (pixels)')
+            axes[0, 0].set_ylabel('Y Position (pixels)')
+            axes[0, 0].legend()
+            axes[0, 0].grid(True, alpha=0.3)
+            axes[0, 0].invert_yaxis()
+            
+            # Show pattern analysis in other plots
+            for i, cycle in enumerate(ankle_pattern['all_cycle_data'][:5]):
+                axes[0, 1].plot(cycle['x'], cycle['y'], alpha=0.5, label=f'Cycle {i+1}')
+            axes[0, 1].plot(ankle_pattern['avg_pattern_x'], ankle_pattern['avg_pattern_y'], 
+                           'black', linewidth=3, label='Average')
+            axes[0, 1].set_title('Ankle: Individual Cycles')
+            axes[0, 1].legend()
+            axes[0, 1].grid(True, alpha=0.3)
+            axes[0, 1].invert_yaxis()
+            
+            # Pattern variability
+            pattern_points = np.arange(len(ankle_pattern['avg_pattern_x']))
+            axes[0, 2].errorbar(pattern_points, ankle_pattern['avg_pattern_x'], 
+                               yerr=ankle_pattern['std_pattern_x'], alpha=0.7, label='X ± std')
+            axes[0, 2].errorbar(pattern_points, ankle_pattern['avg_pattern_y'], 
+                               yerr=ankle_pattern['std_pattern_y'], alpha=0.7, label='Y ± std')
+            axes[0, 2].set_title('Ankle: Pattern Variability')
+            axes[0, 2].legend()
+            axes[0, 2].grid(True, alpha=0.3)
+            
+            # Similarity scores
+            cycle_nums = range(1, len(ankle_pattern['cycle_similarities']) + 1)
+            axes[0, 3].bar(cycle_nums, ankle_pattern['cycle_similarities'], alpha=0.7)
+            axes[0, 3].axhline(y=ankle_pattern['avg_similarity'], color='red', linestyle='--')
+            axes[0, 3].set_title('Ankle: Cycle Similarities')
+            axes[0, 3].grid(True, alpha=0.3)
+        else:
+            # Fallback: show raw trajectory if both methods failed
+            axes[0, 0].plot(ankle_x, ankle_y, 'lightblue', alpha=0.7, label='Raw trajectory')
+            axes[0, 0].scatter(ankle_x[0], ankle_y[0], color='green', s=100, marker='o', label='Start')
+            axes[0, 0].scatter(ankle_x[-1], ankle_y[-1], color='red', s=100, marker='s', label='End')
+            axes[0, 0].set_title('Ankle: Raw Trajectory (No Pattern/Circle Detected)')
+            axes[0, 0].set_xlabel('X Position (pixels)')
+            axes[0, 0].set_ylabel('Y Position (pixels)')
+            axes[0, 0].legend()
+            axes[0, 0].grid(True, alpha=0.3)
+            axes[0, 0].invert_yaxis()
+            
+            # Show message in other plots
+            for j in range(1, 4):
+                axes[0, j].text(0.5, 0.5, 'No pattern or circle\nfit found for ankle', 
+                               ha='center', va='center', transform=axes[0, j].transAxes,
+                               fontsize=12, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                axes[0, j].set_title(f'Ankle: Analysis {j+1}')
     else:
         # No ankle data at all
         for j in range(4):

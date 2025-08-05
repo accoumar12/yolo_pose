@@ -12,7 +12,7 @@ def main() -> None:
     model = YOLO("models/yolo11n-pose.pt")
 
     # Open the video
-    input_video_file_name = "sample_1.mp4"
+    input_video_file_name = "sample_4.mp4"
     capture = cv2.VideoCapture(RAW_DATA_DIR_PATH / input_video_file_name)
 
     # Get video properties
