@@ -1,5 +1,5 @@
 import json
-import matplotlib.pyplot as plt
+from matplotlib import pyplot as plt
 import numpy as np
 from pathlib import Path
 from typing import List, Tuple
@@ -9,6 +9,606 @@ from scipy.ndimage import uniform_filter1d
 
 from pydantic import TypeAdapter
 from yolo_pose.schemas.core import FramesData, KeypointLabel
+
+
+def extract_simple_periodic_pattern(x_pos: List[int], y_pos: List[int], frames: List[int]) -> dict:
+    """
+    Simple fallback pattern detection using peak/valley detection.
+    """
+    print("  Using fallback simple pattern detection")
+    
+    x_array = np.array(x_pos, dtype=float)
+    y_array = np.array(y_pos, dtype=float)
+    frames_array = np.array(frames)
+    
+    # Smooth the signal for better peak detection
+    from scipy.ndimage import gaussian_filter1d
+    y_smooth = gaussian_filter1d(y_array, sigma=2)
+    
+    # Find peaks and valleys in Y trajectory (typical cycling motion)
+    min_cycle_length = 10
+    peaks, _ = signal.find_peaks(y_smooth, distance=min_cycle_length, prominence=np.std(y_smooth) * 0.3)
+    valleys, _ = signal.find_peaks(-y_smooth, distance=min_cycle_length, prominence=np.std(y_smooth) * 0.3)
+    
+    # Create cycles from valley to valley (complete pedal stroke)
+    if len(valleys) < 2:
+        return {'cycles': [], 'pattern_found': False}
+    
+    cycle_data = []
+    for i in range(len(valleys) - 1):
+        start_idx = valleys[i]
+        end_idx = valleys[i + 1]
+        
+        if end_idx - start_idx >= min_cycle_length:
+            cycle_x = x_array[start_idx:end_idx]
+            cycle_y = y_array[start_idx:end_idx]
+            cycle_frames = frames_array[start_idx:end_idx]
+            
+            cycle_data.append({
+                'x': cycle_x,
+                'y': cycle_y,
+                'frames': cycle_frames,
+                'length': len(cycle_x),
+                'start_frame': frames_array[start_idx],
+                'end_frame': frames_array[end_idx]
+            })
+    
+    if len(cycle_data) < 2:
+        return {'cycles': [], 'pattern_found': False}
+    
+    # Calculate average cycle length for normalization
+    cycle_lengths = [c['length'] for c in cycle_data]
+    target_length = int(np.median(cycle_lengths))
+    
+    # Normalize all cycles to same length
+    normalized_cycles_x = []
+    normalized_cycles_y = []
+    
+    for cycle in cycle_data:
+        if len(cycle['x']) >= 5:  # Only use cycles with enough points
+            old_indices = np.linspace(0, 1, len(cycle['x']))
+            new_indices = np.linspace(0, 1, target_length)
+            
+            # Linear interpolation for simplicity
+            interp_x = np.interp(new_indices, old_indices, cycle['x'])
+            interp_y = np.interp(new_indices, old_indices, cycle['y'])
+            
+            normalized_cycles_x.append(interp_x)
+            normalized_cycles_y.append(interp_y)
+    
+    if not normalized_cycles_x:
+        return {'cycles': [], 'pattern_found': False}
+    
+    # Calculate average pattern and statistics
+    avg_pattern_x = np.mean(normalized_cycles_x, axis=0)
+    avg_pattern_y = np.mean(normalized_cycles_y, axis=0)
+    std_pattern_x = np.std(normalized_cycles_x, axis=0)
+    std_pattern_y = np.std(normalized_cycles_y, axis=0)
+    
+    # Calculate pattern quality metrics
+    pattern_consistency = 1.0 / (1.0 + np.mean(std_pattern_x) + np.mean(std_pattern_y))
+    
+    # Calculate how well each cycle matches the average
+    cycle_similarities = []
+    for i, (cycle_x, cycle_y) in enumerate(zip(normalized_cycles_x, normalized_cycles_y)):
+        # Calculate correlation with average pattern
+        corr_x = np.corrcoef(cycle_x, avg_pattern_x)[0, 1] if len(cycle_x) > 1 else 0
+        corr_y = np.corrcoef(cycle_y, avg_pattern_y)[0, 1] if len(cycle_y) > 1 else 0
+        similarity = (corr_x + corr_y) / 2
+        cycle_similarities.append(similarity)
+    
+    # Cycle timing statistics
+    frame_cycles = [(c['start_frame'], c['end_frame']) for c in cycle_data]
+    cycle_durations = [c['end_frame'] - c['start_frame'] for c in cycle_data]
+    
+    print(f"  Simple method found {len(cycle_data)} cycles")
+    
+    return {
+        'pattern_found': True,
+        'cycles': frame_cycles,
+        'num_cycles': len(frame_cycles),
+        'avg_pattern_x': avg_pattern_x.tolist(),
+        'avg_pattern_y': avg_pattern_y.tolist(),
+        'std_pattern_x': std_pattern_x.tolist(),
+        'std_pattern_y': std_pattern_y.tolist(),
+        'pattern_consistency': pattern_consistency,
+        'cycle_similarities': cycle_similarities,
+        'avg_similarity': np.mean(cycle_similarities),
+        'cycle_lengths': cycle_durations,
+        'avg_cycle_length': np.mean(cycle_durations),
+        'cycle_length_std': np.std(cycle_durations),
+        'target_length': target_length,
+        'estimated_period': int(np.mean(cycle_durations)),
+        'all_cycle_data': cycle_data
+    }
+
+
+def extract_periodic_pattern(x_pos: List[int], y_pos: List[int], frames: List[int]) -> dict:
+    """
+    Extract the actual periodic pattern using cross-correlation and template matching.
+    More robust approach for finding true periodic patterns.
+    """
+    if len(x_pos) < 40:  # Need more data for robust analysis
+        return {'cycles': [], 'pattern_found': False}
+    
+    x_array = np.array(x_pos, dtype=float)
+    y_array = np.array(y_pos, dtype=float)
+    frames_array = np.array(frames)
+    
+    print(f"  Analyzing trajectory with {len(x_pos)} points")
+    
+    # Smooth the signal
+    from scipy.ndimage import gaussian_filter1d
+    x_smooth = gaussian_filter1d(x_array, sigma=2)
+    y_smooth = gaussian_filter1d(y_array, sigma=2)
+    complex_smooth = x_smooth + 1j * y_smooth
+    
+    # Method 1: Autocorrelation to find period
+    def find_period_autocorr(input_signal, min_period=10, max_period=None):
+        if max_period is None:
+            max_period = len(input_signal) // 3
+        
+        # Calculate autocorrelation
+        autocorr = np.correlate(input_signal, input_signal, mode='full')
+        autocorr = autocorr[autocorr.size // 2:]
+        
+        # Find peaks in autocorrelation (excluding the zero-lag peak)
+        try:
+            peaks, _ = signal.find_peaks(autocorr[min_period:max_period], 
+                                       height=np.max(autocorr) * 0.2)  # Lower threshold
+            
+            if len(peaks) > 0:
+                return peaks[0] + min_period  # Add back the offset
+        except Exception as e:
+            print(f"    Autocorrelation failed: {e}")
+        return None
+    
+    # Find period using different signals
+    period_y = find_period_autocorr(y_smooth)
+    period_x = find_period_autocorr(x_smooth)
+    period_complex = find_period_autocorr(np.abs(complex_smooth))
+    
+    # Choose the most reliable period estimate
+    periods = [p for p in [period_y, period_x, period_complex] if p is not None]
+    print(f"  Candidate periods: {periods}")
+    
+    if not periods:
+        # Fallback to simple peak detection if autocorrelation fails
+        print("  Autocorrelation failed, using simple peak detection")
+        return extract_simple_periodic_pattern(x_pos, y_pos, frames)
+    
+    # Use median of different estimates
+    estimated_period = int(np.median(periods))
+    
+    print(f"  Estimated period: {estimated_period} frames")
+    
+    # Method 2: Template matching to find actual cycles (more permissive)
+    def extract_cycles_template_matching(input_signal, period):
+        cycles = []
+        
+        # Try different starting points to find the best template
+        best_template = None
+        best_score = -1
+        
+        step_size = max(1, period // 20)  # More starting points
+        for start_offset in range(0, min(period, len(input_signal) - period), step_size):
+            if start_offset + period >= len(input_signal):
+                break
+                
+            template = input_signal[start_offset:start_offset + period]
+            
+            # Cross-correlate template with entire signal
+            correlation = np.correlate(input_signal, template, mode='valid')
+            
+            # Normalize correlation
+            template_norm = np.linalg.norm(template)
+            if template_norm == 0:
+                continue
+                
+            signal_norms = np.array([np.linalg.norm(input_signal[i:i+len(template)]) 
+                                   for i in range(len(correlation))])
+            
+            with np.errstate(divide='ignore', invalid='ignore'):
+                normalized_corr = correlation / (template_norm * signal_norms)
+                normalized_corr = np.nan_to_num(normalized_corr)
+            
+            # Find score of this template
+            score = np.mean(normalized_corr)
+            
+            if score > best_score:
+                best_score = score
+                best_template = template
+        
+        if best_template is None:
+            return [], None
+        
+        print(f"    Best template score: {best_score:.3f}")
+        
+        # Now find all occurrences of the best template (more permissive)
+        correlation = np.correlate(input_signal, best_template, mode='valid')
+        template_norm = np.linalg.norm(best_template)
+        
+        cycle_starts = []
+        i = 0
+        threshold = 0.5  # Lower threshold for cycle detection
+        
+        while i < len(correlation) - len(best_template):
+            # Calculate normalized correlation at this position
+            window = input_signal[i:i+len(best_template)]
+            if len(window) == len(best_template):
+                window_norm = np.linalg.norm(window)
+                if window_norm > 0:
+                    corr_val = np.dot(best_template, window) / (template_norm * window_norm)
+                    
+                    # If correlation is high enough, this is a cycle
+                    if corr_val > threshold:
+                        cycle_starts.append(i)
+                        # Skip ahead to avoid overlapping detections
+                        i += max(1, len(best_template) // 3)  # Allow more overlap
+                    else:
+                        i += 1
+                else:
+                    i += 1
+            else:
+                break
+        
+        print(f"    Found {len(cycle_starts)} cycle starts")
+        
+        # Extract cycles based on detected starts
+        cycles = []
+        for j in range(len(cycle_starts) - 1):
+            start_idx = cycle_starts[j]
+            end_idx = cycle_starts[j + 1]
+            
+            if end_idx - start_idx > len(best_template) // 3:  # More permissive length
+                cycles.append({
+                    'start_idx': start_idx,
+                    'end_idx': end_idx,
+                    'length': end_idx - start_idx
+                })
+        
+        return cycles, best_template
+    
+    # Extract cycles using template matching
+    cycles_y, template_y = extract_cycles_template_matching(y_smooth, estimated_period)
+    cycles_x, template_x = extract_cycles_template_matching(x_smooth, estimated_period)
+    
+    # Use the method that found more cycles
+    if len(cycles_y) >= len(cycles_x):
+        cycles_info = cycles_y
+        print(f"  Using Y-based cycle detection: {len(cycles_y)} cycles")
+    else:
+        cycles_info = cycles_x
+        print(f"  Using X-based cycle detection: {len(cycles_x)} cycles")
+    
+    if len(cycles_info) < 2:
+        return {'cycles': [], 'pattern_found': False}
+    
+    # Extract cycle data
+    cycle_data = []
+    for cycle in cycles_info:
+        start_idx = cycle['start_idx']
+        end_idx = cycle['end_idx']
+        
+        cycle_x = x_array[start_idx:end_idx]
+        cycle_y = y_array[start_idx:end_idx]
+        cycle_frames = frames_array[start_idx:end_idx]
+        
+        cycle_data.append({
+            'x': cycle_x,
+            'y': cycle_y,
+            'frames': cycle_frames,
+            'length': len(cycle_x),
+            'start_frame': frames_array[start_idx],
+            'end_frame': frames_array[end_idx]
+        })
+    
+    # Calculate average cycle length for normalization
+    cycle_lengths = [c['length'] for c in cycle_data]
+    target_length = int(np.median(cycle_lengths))
+    
+    # Normalize all cycles to same length using better interpolation
+    normalized_cycles_x = []
+    normalized_cycles_y = []
+    
+    for cycle in cycle_data:
+        if len(cycle['x']) >= 5:  # Only use cycles with enough points
+            # Use spline interpolation for smoother results
+            from scipy.interpolate import interp1d
+            
+            old_indices = np.linspace(0, 1, len(cycle['x']))
+            new_indices = np.linspace(0, 1, target_length)
+            
+            # Create interpolation functions
+            try:
+                f_x = interp1d(old_indices, cycle['x'], kind='cubic', 
+                              bounds_error=False, fill_value='extrapolate')
+                f_y = interp1d(old_indices, cycle['y'], kind='cubic', 
+                              bounds_error=False, fill_value='extrapolate')
+                
+                interp_x = f_x(new_indices)
+                interp_y = f_y(new_indices)
+                
+                normalized_cycles_x.append(interp_x)
+                normalized_cycles_y.append(interp_y)
+            except Exception:
+                # Fallback to linear interpolation
+                interp_x = np.interp(new_indices, old_indices, cycle['x'])
+                interp_y = np.interp(new_indices, old_indices, cycle['y'])
+                
+                normalized_cycles_x.append(interp_x)
+                normalized_cycles_y.append(interp_y)
+    
+    if not normalized_cycles_x:
+        return {'cycles': [], 'pattern_found': False}
+    
+    # Calculate average pattern and statistics
+    avg_pattern_x = np.mean(normalized_cycles_x, axis=0)
+    avg_pattern_y = np.mean(normalized_cycles_y, axis=0)
+    std_pattern_x = np.std(normalized_cycles_x, axis=0)
+    std_pattern_y = np.std(normalized_cycles_y, axis=0)
+    
+    # Calculate pattern quality metrics
+    pattern_consistency = 1.0 / (1.0 + np.mean(std_pattern_x) + np.mean(std_pattern_y))
+    
+    # Calculate how well each cycle matches the average
+    cycle_similarities = []
+    for i, (cycle_x, cycle_y) in enumerate(zip(normalized_cycles_x, normalized_cycles_y)):
+        # Calculate correlation with average pattern
+        corr_x = np.corrcoef(cycle_x, avg_pattern_x)[0, 1]
+        corr_y = np.corrcoef(cycle_y, avg_pattern_y)[0, 1]
+        similarity = (corr_x + corr_y) / 2
+        cycle_similarities.append(similarity)
+    
+    # Cycle timing statistics
+    frame_cycles = [(c['start_frame'], c['end_frame']) for c in cycle_data]
+    cycle_durations = [c['end_frame'] - c['start_frame'] for c in cycle_data]
+    
+    return {
+        'pattern_found': True,
+        'cycles': frame_cycles,
+        'num_cycles': len(frame_cycles),
+        'avg_pattern_x': avg_pattern_x.tolist(),
+        'avg_pattern_y': avg_pattern_y.tolist(),
+        'std_pattern_x': std_pattern_x.tolist(),
+        'std_pattern_y': std_pattern_y.tolist(),
+        'pattern_consistency': pattern_consistency,
+        'cycle_similarities': cycle_similarities,
+        'avg_similarity': np.mean(cycle_similarities),
+        'cycle_lengths': cycle_durations,
+        'avg_cycle_length': np.mean(cycle_durations),
+        'cycle_length_std': np.std(cycle_durations),
+        'target_length': target_length,
+        'estimated_period': estimated_period,
+        'all_cycle_data': cycle_data
+    }
+
+
+def analyze_periodic_patterns(frames_data: FramesData, output_dir: Path) -> dict:
+    """Analyze periodic patterns in ankle and knee motion without geometric assumptions."""
+    
+    # Extract data for ankle and knee
+    ankle_frames, ankle_x, ankle_y = extract_keypoint_positions(frames_data, KeypointLabel.RIGHT_ANKLE)
+    knee_frames, knee_x, knee_y = extract_keypoint_positions(frames_data, KeypointLabel.RIGHT_KNEE)
+    
+    results = {}
+    
+    print("\n" + "="*50)
+    print("PERIODIC PATTERN ANALYSIS")
+    print("="*50)
+    
+    # Initialize pattern results with default empty values
+    ankle_pattern = {'pattern_found': False}
+    knee_pattern = {'pattern_found': False}
+    
+    # Analyze ankle pattern
+    if ankle_frames:
+        ankle_pattern = extract_periodic_pattern(ankle_x, ankle_y, ankle_frames)
+        results['ankle'] = ankle_pattern
+        
+        if ankle_pattern['pattern_found']:
+            print("\nANKLE PERIODIC MOTION:")
+            print(f"  Detected cycles: {ankle_pattern['num_cycles']}")
+            print(f"  Estimated period: {ankle_pattern['estimated_period']} frames")
+            print(f"  Average cycle length: {ankle_pattern['avg_cycle_length']:.1f} frames")
+            print(f"  Cycle length std: {ankle_pattern['cycle_length_std']:.1f} frames")
+            print(f"  Pattern consistency: {ankle_pattern['pattern_consistency']:.3f}")
+            print(f"  Average similarity: {ankle_pattern['avg_similarity']:.3f}")
+            print(f"  Pattern length: {ankle_pattern['target_length']} points")
+            
+            # Calculate motion ranges for the average pattern
+            x_range = np.max(ankle_pattern['avg_pattern_x']) - np.min(ankle_pattern['avg_pattern_x'])
+            y_range = np.max(ankle_pattern['avg_pattern_y']) - np.min(ankle_pattern['avg_pattern_y'])
+            print(f"  Pattern X range: {x_range:.1f} pixels")
+            print(f"  Pattern Y range: {y_range:.1f} pixels")
+        else:
+            print("\nANKLE: No periodic pattern detected")
+    
+    # Analyze knee pattern
+    if knee_frames:
+        knee_pattern = extract_periodic_pattern(knee_x, knee_y, knee_frames)
+        results['knee'] = knee_pattern
+        
+        if knee_pattern['pattern_found']:
+            print("\nKNEE PERIODIC MOTION:")
+            print(f"  Detected cycles: {knee_pattern['num_cycles']}")
+            print(f"  Estimated period: {knee_pattern['estimated_period']} frames")
+            print(f"  Average cycle length: {knee_pattern['avg_cycle_length']:.1f} frames")
+            print(f"  Cycle length std: {knee_pattern['cycle_length_std']:.1f} frames")
+            print(f"  Pattern consistency: {knee_pattern['pattern_consistency']:.3f}")
+            print(f"  Average similarity: {knee_pattern['avg_similarity']:.3f}")
+            print(f"  Pattern length: {knee_pattern['target_length']} points")
+            
+            # Calculate motion ranges for the average pattern
+            x_range = np.max(knee_pattern['avg_pattern_x']) - np.min(knee_pattern['avg_pattern_x'])
+            y_range = np.max(knee_pattern['avg_pattern_y']) - np.min(knee_pattern['avg_pattern_y'])
+            print(f"  Pattern X range: {x_range:.1f} pixels")
+            print(f"  Pattern Y range: {y_range:.1f} pixels")
+        else:
+            print("\nKNEE: No periodic pattern detected")
+    
+    # Create visualization
+    fig, axes = plt.subplots(2, 4, figsize=(20, 12))
+    
+    # Plot ankle analysis
+    if ankle_frames and ankle_pattern['pattern_found']:
+        # Original trajectory
+        axes[0, 0].plot(ankle_x, ankle_y, 'lightblue', alpha=0.7, label='Full trajectory')
+        axes[0, 0].plot(ankle_pattern['avg_pattern_x'], ankle_pattern['avg_pattern_y'], 
+                       'blue', linewidth=3, label='Average pattern')
+        axes[0, 0].scatter(ankle_pattern['avg_pattern_x'][0], ankle_pattern['avg_pattern_y'][0], 
+                          color='green', s=100, marker='o', label='Pattern start')
+        axes[0, 0].set_title('Ankle: Trajectory + Average Pattern')
+        axes[0, 0].set_xlabel('X Position (pixels)')
+        axes[0, 0].set_ylabel('Y Position (pixels)')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        axes[0, 0].invert_yaxis()
+        
+        # Individual cycles overlay
+        axes[0, 1].plot(ankle_pattern['avg_pattern_x'], ankle_pattern['avg_pattern_y'], 
+                       'black', linewidth=3, label='Average pattern')
+        for i, cycle in enumerate(ankle_pattern['all_cycle_data'][:5]):  # Show first 5 cycles
+            axes[0, 1].plot(cycle['x'], cycle['y'], alpha=0.5, label=f'Cycle {i+1}')
+        axes[0, 1].set_title('Ankle: Individual Cycles vs Average')
+        axes[0, 1].set_xlabel('X Position (pixels)')
+        axes[0, 1].set_ylabel('Y Position (pixels)')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].invert_yaxis()
+        
+        # Pattern consistency (error bars)
+        pattern_points = np.arange(len(ankle_pattern['avg_pattern_x']))
+        axes[0, 2].errorbar(pattern_points, ankle_pattern['avg_pattern_x'], 
+                           yerr=ankle_pattern['std_pattern_x'], 
+                           alpha=0.7, label='X pattern ± std')
+        axes[0, 2].errorbar(pattern_points, ankle_pattern['avg_pattern_y'], 
+                           yerr=ankle_pattern['std_pattern_y'], 
+                           alpha=0.7, label='Y pattern ± std')
+        axes[0, 2].set_title('Ankle: Pattern Variability')
+        axes[0, 2].set_xlabel('Pattern Point Index')
+        axes[0, 2].set_ylabel('Position (pixels)')
+        axes[0, 2].legend()
+        axes[0, 2].grid(True, alpha=0.3)
+        
+        # Cycle similarity scores
+        cycle_nums = range(1, len(ankle_pattern['cycle_similarities']) + 1)
+        axes[0, 3].bar(cycle_nums, ankle_pattern['cycle_similarities'], alpha=0.7)
+        axes[0, 3].axhline(y=ankle_pattern['avg_similarity'], color='red', linestyle='--', 
+                          label=f'Average: {ankle_pattern["avg_similarity"]:.3f}')
+        axes[0, 3].set_title('Ankle: Cycle Similarity Scores')
+        axes[0, 3].set_xlabel('Cycle Number')
+        axes[0, 3].set_ylabel('Similarity to Average')
+        axes[0, 3].legend()
+        axes[0, 3].grid(True, alpha=0.3)
+    elif ankle_frames:
+        # Fallback: show raw trajectory if pattern detection failed
+        axes[0, 0].plot(ankle_x, ankle_y, 'lightblue', alpha=0.7, label='Raw trajectory')
+        axes[0, 0].scatter(ankle_x[0], ankle_y[0], color='green', s=100, marker='o', label='Start')
+        axes[0, 0].scatter(ankle_x[-1], ankle_y[-1], color='red', s=100, marker='s', label='End')
+        axes[0, 0].set_title('Ankle: Raw Trajectory (No Pattern Detected)')
+        axes[0, 0].set_xlabel('X Position (pixels)')
+        axes[0, 0].set_ylabel('Y Position (pixels)')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        axes[0, 0].invert_yaxis()
+        
+        # Show message in other plots
+        for j in range(1, 4):
+            axes[0, j].text(0.5, 0.5, 'No periodic pattern\ndetected for ankle', 
+                           ha='center', va='center', transform=axes[0, j].transAxes,
+                           fontsize=12, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            axes[0, j].set_title(f'Ankle: Pattern Analysis {j+1}')
+    else:
+        # No ankle data at all
+        for j in range(4):
+            axes[0, j].text(0.5, 0.5, 'No ankle data\navailable', 
+                           ha='center', va='center', transform=axes[0, j].transAxes,
+                           fontsize=12, bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.5))
+            axes[0, j].set_title(f'Ankle: No Data {j+1}')
+    
+    # Plot knee analysis
+    if knee_frames and knee_pattern['pattern_found']:
+        # Original trajectory
+        axes[1, 0].plot(knee_x, knee_y, 'lightcoral', alpha=0.7, label='Full trajectory')
+        axes[1, 0].plot(knee_pattern['avg_pattern_x'], knee_pattern['avg_pattern_y'], 
+                       'red', linewidth=3, label='Average pattern')
+        axes[1, 0].scatter(knee_pattern['avg_pattern_x'][0], knee_pattern['avg_pattern_y'][0], 
+                          color='green', s=100, marker='o', label='Pattern start')
+        axes[1, 0].set_title('Knee: Trajectory + Average Pattern')
+        axes[1, 0].set_xlabel('X Position (pixels)')
+        axes[1, 0].set_ylabel('Y Position (pixels)')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        axes[1, 0].invert_yaxis()
+        
+        # Individual cycles overlay
+        axes[1, 1].plot(knee_pattern['avg_pattern_x'], knee_pattern['avg_pattern_y'], 
+                       'black', linewidth=3, label='Average pattern')
+        for i, cycle in enumerate(knee_pattern['all_cycle_data'][:5]):  # Show first 5 cycles
+            axes[1, 1].plot(cycle['x'], cycle['y'], alpha=0.5, label=f'Cycle {i+1}')
+        axes[1, 1].set_title('Knee: Individual Cycles vs Average')
+        axes[1, 1].set_xlabel('X Position (pixels)')
+        axes[1, 1].set_ylabel('Y Position (pixels)')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+        axes[1, 1].invert_yaxis()
+        
+        # Pattern consistency (error bars)
+        pattern_points = np.arange(len(knee_pattern['avg_pattern_x']))
+        axes[1, 2].errorbar(pattern_points, knee_pattern['avg_pattern_x'], 
+                           yerr=knee_pattern['std_pattern_x'], 
+                           alpha=0.7, label='X pattern ± std')
+        axes[1, 2].errorbar(pattern_points, knee_pattern['avg_pattern_y'], 
+                           yerr=knee_pattern['std_pattern_y'], 
+                           alpha=0.7, label='Y pattern ± std')
+        axes[1, 2].set_title('Knee: Pattern Variability')
+        axes[1, 2].set_xlabel('Pattern Point Index')
+        axes[1, 2].set_ylabel('Position (pixels)')
+        axes[1, 2].legend()
+        axes[1, 2].grid(True, alpha=0.3)
+        
+        # Cycle similarity scores
+        cycle_nums = range(1, len(knee_pattern['cycle_similarities']) + 1)
+        axes[1, 3].bar(cycle_nums, knee_pattern['cycle_similarities'], alpha=0.7)
+        axes[1, 3].axhline(y=knee_pattern['avg_similarity'], color='red', linestyle='--', 
+                          label=f'Average: {knee_pattern["avg_similarity"]:.3f}')
+        axes[1, 3].set_title('Knee: Cycle Similarity Scores')
+        axes[1, 3].set_xlabel('Cycle Number')
+        axes[1, 3].set_ylabel('Similarity to Average')
+        axes[1, 3].legend()
+        axes[1, 3].grid(True, alpha=0.3)
+    elif knee_frames:
+        # Fallback: show raw trajectory if pattern detection failed
+        axes[1, 0].plot(knee_x, knee_y, 'lightcoral', alpha=0.7, label='Raw trajectory')
+        axes[1, 0].scatter(knee_x[0], knee_y[0], color='green', s=100, marker='o', label='Start')
+        axes[1, 0].scatter(knee_x[-1], knee_y[-1], color='red', s=100, marker='s', label='End')
+        axes[1, 0].set_title('Knee: Raw Trajectory (No Pattern Detected)')
+        axes[1, 0].set_xlabel('X Position (pixels)')
+        axes[1, 0].set_ylabel('Y Position (pixels)')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        axes[1, 0].invert_yaxis()
+        
+        # Show message in other plots
+        for j in range(1, 4):
+            axes[1, j].text(0.5, 0.5, 'No periodic pattern\ndetected for knee', 
+                           ha='center', va='center', transform=axes[1, j].transAxes,
+                           fontsize=12, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            axes[1, j].set_title(f'Knee: Pattern Analysis {j+1}')
+    else:
+        # No knee data at all
+        for j in range(4):
+            axes[1, j].text(0.5, 0.5, 'No knee data\navailable', 
+                           ha='center', va='center', transform=axes[1, j].transAxes,
+                           fontsize=12, bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.5))
+            axes[1, j].set_title(f'Knee: No Data {j+1}')
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'periodic_patterns_analysis.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    return results
 
 
 def smooth_trajectory(positions: List[int], window_size: int = 5) -> List[float]:
@@ -354,7 +954,7 @@ def analyze_movement_statistics(frames_data: FramesData, output_dir: Path) -> No
         print(f"{keypoint}: {data['total_displacement']:.1f}px total, {data['average_displacement_per_frame']:.1f}px avg/frame")
 
 
-def save_analysis_results(frames_data: FramesData, output_dir: Path) -> None:
+def save_analysis_results(frames_data: FramesData, output_dir: Path, pattern_results: dict = None) -> None:
     """Save comprehensive analysis results to a text file."""
     results_file = output_dir / 'comprehensive_analysis.txt'
     
@@ -403,7 +1003,40 @@ def save_analysis_results(frames_data: FramesData, output_dir: Path) -> None:
             f.write(f"  Stability score: {100 / (1 + data['x_std'] + data['y_std']):.1f}/100\n")
             f.write("\n")
         
-        f.write("\nCYCLING MOTION ANALYSIS\n")
+        if pattern_results:
+            f.write("PERIODIC PATTERN ANALYSIS\n")
+            f.write("-" * 30 + "\n")
+            f.write("Extracted actual motion patterns without geometric assumptions:\n\n")
+            
+            if 'ankle' in pattern_results and pattern_results['ankle']['pattern_found']:
+                ankle = pattern_results['ankle']
+                f.write("ANKLE PERIODIC MOTION:\n")
+                f.write(f"  Detected cycles: {ankle['num_cycles']}\n")
+                f.write(f"  Average cycle length: {ankle['avg_cycle_length']:.1f} frames\n")
+                f.write(f"  Cycle length std: {ankle['cycle_length_std']:.1f} frames\n")
+                f.write(f"  Pattern consistency: {ankle['pattern_consistency']:.3f}\n")
+                f.write(f"  Pattern length: {ankle['target_length']} points\n")
+                
+                x_range = np.max(ankle['avg_pattern_x']) - np.min(ankle['avg_pattern_x'])
+                y_range = np.max(ankle['avg_pattern_y']) - np.min(ankle['avg_pattern_y'])
+                f.write(f"  Pattern X range: {x_range:.1f} pixels\n")
+                f.write(f"  Pattern Y range: {y_range:.1f} pixels\n\n")
+            
+            if 'knee' in pattern_results and pattern_results['knee']['pattern_found']:
+                knee = pattern_results['knee']
+                f.write("KNEE PERIODIC MOTION:\n")
+                f.write(f"  Detected cycles: {knee['num_cycles']}\n")
+                f.write(f"  Average cycle length: {knee['avg_cycle_length']:.1f} frames\n")
+                f.write(f"  Cycle length std: {knee['cycle_length_std']:.1f} frames\n")
+                f.write(f"  Pattern consistency: {knee['pattern_consistency']:.3f}\n")
+                f.write(f"  Pattern length: {knee['target_length']} points\n")
+                
+                x_range = np.max(knee['avg_pattern_x']) - np.min(knee['avg_pattern_x'])
+                y_range = np.max(knee['avg_pattern_y']) - np.min(knee['avg_pattern_y'])
+                f.write(f"  Pattern X range: {x_range:.1f} pixels\n")
+                f.write(f"  Pattern Y range: {y_range:.1f} pixels\n\n")
+        
+        f.write("CYCLING MOTION ANALYSIS\n")
         f.write("-" * 30 + "\n")
         f.write("These joints show periodic motion during pedaling:\n\n")
         
@@ -419,15 +1052,16 @@ def save_analysis_results(frames_data: FramesData, output_dir: Path) -> None:
             
             f.write("\n")
         
-        f.write("\nRECOMMendations:\n")
+        f.write("RECOMMENDATIONS:\n")
         f.write("-" * 20 + "\n")
         f.write("1. For stable joints (hip, shoulder, elbow, wrist):\n")
         f.write("   - Use average positions for bike fitting measurements\n")
         f.write("   - High variability indicates potential measurement issues\n\n")
-        f.write("2. For cycling joints (ankle, knee):\n")
-        f.write("   - Analyze range of motion and cycle patterns\n")
-        f.write("   - Consider filtering/smoothing for cleaner measurements\n")
-        f.write("   - Use cycle-averaged positions or extreme positions\n\n")
+        f.write("2. For periodic joints (ankle, knee):\n")
+        f.write("   - Use extracted average patterns for analysis\n")
+        f.write("   - Pattern consistency indicates measurement quality\n")
+        f.write("   - Individual cycles show variation in technique\n")
+        f.write("   - Use pattern extremes for range of motion analysis\n\n")
     
     print(f"Comprehensive analysis saved to: {results_file}")
 
@@ -489,6 +1123,10 @@ def main():
     print("Analyzing cycling motion patterns...")
     analyze_cycling_motion(frames_data, output_dir)
     
+    # Analyze actual periodic patterns (no geometric assumptions)
+    print("Analyzing periodic patterns...")
+    pattern_results = analyze_periodic_patterns(frames_data, output_dir)
+    
     # Create traditional visualizations
     print("Creating trajectory plots...")
     plot_keypoint_trajectories(frames_data, output_dir)
@@ -503,13 +1141,23 @@ def main():
     analyze_movement_statistics(frames_data, output_dir)
     
     print("Generating comprehensive analysis report...")
-    save_analysis_results(frames_data, output_dir)
+    save_analysis_results(frames_data, output_dir, pattern_results)
     
     print(f"\nAll visualizations and analysis saved to: {output_dir}")
     print("\nSUMMARY:")
     print("- Use average positions for: hip, shoulder, elbow, wrist (stable joints)")
-    print("- Apply smoothing/filtering for: ankle, knee (periodic motion)")
+    print("- Use extracted patterns for: ankle, knee (periodic motion)")
     print("- Check 'comprehensive_analysis.txt' for detailed recommendations")
+    
+    # Print key pattern findings
+    if pattern_results:
+        print("\nKey Pattern Findings:")
+        if 'ankle' in pattern_results and pattern_results['ankle']['pattern_found']:
+            ankle = pattern_results['ankle']
+            print(f"- Ankle: {ankle['num_cycles']} cycles, consistency: {ankle['pattern_consistency']:.3f}")
+        if 'knee' in pattern_results and pattern_results['knee']['pattern_found']:
+            knee = pattern_results['knee']
+            print(f"- Knee: {knee['num_cycles']} cycles, consistency: {knee['pattern_consistency']:.3f}")
 
 
 if __name__ == "__main__":

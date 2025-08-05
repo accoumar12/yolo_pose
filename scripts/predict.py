@@ -41,7 +41,7 @@ def main() -> None:
         ret, frame = capture.read()
         if not ret:
             break
-        if frame_count > 200:
+        if frame_count > 2000:
             break
 
         # Run model prediction
